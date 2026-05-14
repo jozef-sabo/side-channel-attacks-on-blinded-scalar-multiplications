@@ -5,6 +5,9 @@ import logging
 import sys
 import secrets
 import time
+
+import numpy as np
+
 from elliptic_curves import EllipticCurve, curves
 
 
@@ -19,12 +22,16 @@ def generate_blinders(curve: EllipticCurve, multipliers: list[int]) -> list[int]
     return output
 
 
-def generate_multipliers(number_of_values: int, multiplier_bits: int) -> list[int]:
+def generate_multipliers(number_of_values: int, multiplier_bits: int, original: bool) -> list[int]:
     logging.info(f"Genrating {number_of_values} multipliers (r) of {multiplier_bits} bits")
 
     output = []
     for _ in range(number_of_values):
-        r = secrets.randbits(multiplier_bits)
+        if original:
+            r = random.randint(3<<(multiplier_bits-2),(1<<multiplier_bits)-1)
+            assert r.bit_length() == multiplier_bits
+        else:
+            r = secrets.randbits(multiplier_bits)
         logging.debug(f"({_ + 1}/{number_of_values}), r = {r}")
         output.append(r)
 
@@ -42,16 +49,27 @@ def generate_blinded_values(d: int, blinders: list[int]) -> list[int]:
     return output
 
 
-def generate_error_vectors(size: int, error_rate: int, number_of_values: int) -> list[int]:
+def generate_error_vectors(size: int, error_rate: int, number_of_values: int, original: bool) -> list[int]:
     logging.info(
         f"Genrating {number_of_values} error vectors (εi) with error rate of {error_rate}% and size {size} bits")
 
     output = []
     for _ in range(number_of_values):
         e = 0
-        for bit_num in range(size):
-            if secrets.randbelow(100) < error_rate:
-                e ^= (1 << bit_num)
+        if original:
+            sigma = 0.5  # for \epsilon_b = 0.15
+            b = np.zeros(size, dtype=np.uint8)
+            b_noisy = b + np.random.normal(0, sigma, size=b.shape)
+            b_noisy = np.uint8(b_noisy > 0.5)
+
+            pad_length = (8 - len(b) % 8) % 8
+            b_padded = np.pad(b_noisy, (pad_length, 0), mode="constant")
+            byte_data = np.packbits(b_padded).tobytes()
+            e = int.from_bytes(byte_data, byteorder="big")
+        else:
+            for bit_num in range(size):
+                if secrets.randbelow(100) < error_rate:
+                    e ^= (1 << bit_num)
         logging.debug(f"({_ + 1}/{number_of_values}), εi = {e}")
         output.append(e)
 
@@ -85,13 +103,13 @@ def generate_out_binary(filename: str, mode: str, curve: EllipticCurve, d: int, 
         pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def generate_values(curve: EllipticCurve, d: int, number_of_values: int, multiplier_bits: int, error_rate: int):
+def generate_values(curve: EllipticCurve, d: int, number_of_values: int, multiplier_bits: int, error_rate: int, original: bool):
     out_value_size = curve.size + multiplier_bits
 
-    multipliers = generate_multipliers(number_of_values, multiplier_bits)
+    multipliers = generate_multipliers(number_of_values, multiplier_bits, original)
     blinders = generate_blinders(curve, multipliers)
     blinded_ds = generate_blinded_values(d, blinders)
-    error_vectors = generate_error_vectors(out_value_size, error_rate, number_of_values)
+    error_vectors = generate_error_vectors(out_value_size, error_rate, number_of_values, original)
 
     blinded_with_errors = apply_error_vectors(blinded_ds, error_vectors)
 
@@ -99,13 +117,13 @@ def generate_values(curve: EllipticCurve, d: int, number_of_values: int, multipl
 
 
 def generate(curve: EllipticCurve, number_of_values: int, multiplier_bits: int, error_rate: int,
-             output_file: str):
+             output_file: str, original: bool):
     logging.info(f"Generating random value (d) of {curve.size} bits")
     d = random.getrandbits(curve.d_size)
     logging.info(f"d = {d}, size {curve.size} bits")
 
     blinded_with_errors, multipliers, error_vectors, d = generate_values(curve, d, number_of_values, multiplier_bits,
-                                                                         error_rate)
+                                                                         error_rate, original)
 
     generate_out_binary(output_file, "w", curve, d, blinded_with_errors, multipliers, multiplier_bits, error_vectors,
                       error_rate)
@@ -132,12 +150,13 @@ if __name__ == "__main__":
     parser.add_argument('-e', "--error-rate", choices=range(0, 100 + 1), help="Percentage of the error rate (ε)",
                         type=int, default=15)
     parser.add_argument('-m', "--multiplier-bits", help="Number of bits of a multiplier (r)", type=int, default=64)
+    parser.add_argument('-o', '--original', help="Uses original generation proposed by authors", action="store_true")
 
     args = parser.parse_args()
 
     t1 = time.perf_counter(), time.process_time()
 
-    generate(curves[args.curve], args.count, args.multiplier_bits, args.error_rate, args.out_file)
+    generate(curves[args.curve], args.count, args.multiplier_bits, args.error_rate, args.out_file, args.original)
 
     t2 = time.perf_counter(), time.process_time()
     print(f"Real time: {t2[0] - t1[0]:.2f} seconds", file=sys.stderr)
